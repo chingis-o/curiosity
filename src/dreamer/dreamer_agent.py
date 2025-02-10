@@ -18,63 +18,56 @@ isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 
 class Agent(embodied.jax.Agent):
 
-  banner = [
-      r"---  ___                           __   ______ ---",
-      r"--- |   \ _ _ ___ __ _ _ __  ___ _ \ \ / /__ / ---",
-      r"--- | |) | '_/ -_) _` | '  \/ -_) '/\ V / |_ \ ---",
-      r"--- |___/|_| \___\__,_|_|_|_\___|_|  \_/ |___/ ---",
-  ]
-
-  def __init__(self, obs_space, act_space, config):
-    self.obs_space = obs_space
-    self.act_space = act_space
+  def __init__(self, observation_space, action_space, config):
+    self.observation_space = observation_space
+    self.action_space = action_space
     self.config = config
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
-    enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
-    dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
-    self.enc = {
+    encoder_space = {k: v for k, v in observation_space.items() if k not in exclude}
+    decoder_space = {k: v for k, v in observation_space.items() if k not in exclude}
+    self.encoder = {
         'simple': rssm.Encoder,
-    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
-    self.dyn = {
+    }[config.enc.typ](encoder_space, **config.enc[config.enc.typ], name='enc')
+    self.dynamic = {
         'rssm': rssm.RSSM,
-    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
-    self.dec = {
+    }[config.dyn.typ](action_space, **config.dyn[config.dyn.typ], name='dyn')
+    self.decoder = {
         'simple': rssm.Decoder,
-    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
+    }[config.dec.typ](decoder_space, **config.dec[config.dec.typ], name='dec')
 
-    self.feat2tensor = lambda x: jnp.concatenate([
+    self.feature2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
         nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)
-    self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
-    self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
+    self.reward = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
+    self.continuation = embodied.jax.MLPHead(binary, **config.conhead, name='con')
 
-    d1, d2 = config.policy_dist_disc, config.policy_dist_cont
-    outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
-    self.pol = embodied.jax.MLPHead(
-        act_space, outs, **config.policy, name='pol')
+    descrete_distribution, continous_distribution = config.policy_dist_disc, config.policy_dist_cont
+    outputs = {k: descrete_distribution if v.discrete else continous_distribution for k, v in action_space.items()}
+    self.policy = embodied.jax.MLPHead(
+        action_space, outputs, **config.policy, name='pol')
 
-    self.val = embodied.jax.MLPHead(scalar, **config.value, name='val')
-    self.slowval = embodied.jax.SlowModel(
+    self.value = embodied.jax.MLPHead(scalar, **config.value, name='val')
+    self.slow_value = embodied.jax.SlowModel(
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
-        source=self.val, **config.slowvalue)
+        source=self.value, **config.slowvalue)
 
-    self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
-    self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
-    self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
+    self.returns_norm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
+    self.value_norm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
+    self.advantage_norm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
     self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+        self.dynamic, self.encoder, self.decoder, self.reward, self.continuation, self.policy, self.value]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
-    scales.update({k: rec for k in dec_space})
+    scales.update({k: rec for k in decoder_space})
     self.scales = scales
 
   @property
@@ -88,18 +81,18 @@ class Agent(embodied.jax.Agent):
     spaces['stepid'] = elements.Space(np.uint8, 20)
     if self.config.replay_context:
       spaces.update(elements.tree.flatdict(dict(
-          enc=self.enc.entry_space,
-          dyn=self.dyn.entry_space,
-          dec=self.dec.entry_space)))
+          enc=self.encoder.entry_space,
+          dyn=self.dynamic.entry_space,
+          dec=self.decoder.entry_space)))
     return spaces
 
   def init_policy(self, batch_size):
     zeros = lambda x: jnp.zeros((batch_size, *x.shape), x.dtype)
     return (
-        self.enc.initial(batch_size),
-        self.dyn.initial(batch_size),
-        self.dec.initial(batch_size),
-        jax.tree.map(zeros, self.act_space))
+        self.encoder.initial(batch_size),
+        self.dynamic.initial(batch_size),
+        self.decoder.initial(batch_size),
+        jax.tree.map(zeros, self.action_space))
 
   def init_train(self, batch_size):
     return self.init_policy(batch_size)
@@ -107,74 +100,74 @@ class Agent(embodied.jax.Agent):
   def init_report(self, batch_size):
     return self.init_policy(batch_size)
 
-  def policy(self, carry, obs, mode='train'):
-    (enc_carry, dyn_carry, dec_carry, prevact) = carry
+  def policy(self, current_state, observation, mode='train'):
+    (encoder_state, dynamic_state, decoder_state, previous_action) = current_state
     kw = dict(training=False, single=True)
-    reset = obs['is_first']
-    enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
-    dyn_carry, dyn_entry, feat = self.dyn.observe(
-        dyn_carry, tokens, prevact, reset, **kw)
-    dec_entry = {}
-    if dec_carry:
-      dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
-    policy = self.pol(self.feat2tensor(feat), bdims=1)
-    act = sample(policy)
-    out = {}
-    out['finite'] = elements.tree.flatdict(jax.tree.map(
+    reset = observation['is_first']
+    encoder_state, encoder_entry, tokens = self.encoder(encoder_state, observation, reset, **kw)
+    dynamic_state, dynamic_entry, features = self.dynamic.observe(
+        dynamic_state, tokens, previous_action, reset, **kw)
+    decoder_entry = {}
+    if decoder_state:
+      decoder_state, decoder_entry, reconstruction = self.decoder(decoder_state, features, reset, **kw)
+    policy = self.policy(self.feature2tensor(features), bdims=1)
+    action = sample(policy)
+    output = {}
+    output['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
-        dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
-    carry = (enc_carry, dyn_carry, dec_carry, act)
+        dict(obs=observation, carry=current_state, tokens=tokens, feat=features, act=action)))
+    current_state = (encoder_state, dynamic_state, decoder_state, action)
     if self.config.replay_context:
-      out.update(elements.tree.flatdict(dict(
-          enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
-    return carry, act, out
+      output.update(elements.tree.flatdict(dict(
+          enc=encoder_entry, dyn=dynamic_entry, dec=decoder_entry)))
+    return current_state, action, output
 
-  def train(self, carry, data):
-    carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
-    metrics, (carry, entries, outs, mets) = self.opt(
-        self.loss, carry, obs, prevact, training=True, has_aux=True)
-    metrics.update(mets)
-    self.slowval.update()
-    outs = {}
+  def train(self, current_state, data):
+    current_state, observation, previous_action, stepid = self._apply_replay_context(current_state, data)
+    metrics, (current_state, entries, outputs, _metrics) = self.opt(
+        self.loss, current_state, observation, previous_action, training=True, has_aux=True)
+    metrics.update(_metrics)
+    self.slow_value.update()
+    outputs = {}
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
-          stepid=stepid, enc=entries[0], dyn=entries[1], dec=entries[2]))
-      B, T = obs['is_first'].shape
+          stepid=stepid, encoder=entries[0], dynamic=entries[1], decoder=entries[2]))
+      B, T = observation['is_first'].shape
       assert all(x.shape[:2] == (B, T) for x in updates.values()), (
           (B, T), {k: v.shape for k, v in updates.items()})
-      outs['replay'] = updates
+      outputs['replay'] = updates
     # if self.config.replay.fracs.priority > 0:
     #   outs['replay']['priority'] = losses['model']
-    carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
-    return carry, outs, metrics
+    current_state = (*current_state, {k: data[k][:, -1] for k in self.action_space})
+    return current_state, outputs, metrics
 
-  def loss(self, carry, obs, prevact, training):
-    enc_carry, dyn_carry, dec_carry = carry
-    reset = obs['is_first']
+  def loss(self, current_state, observation, previous_action, training):
+    encoder_state, dynamic_state, decoder_state = current_state
+    reset = observation['is_first']
     B, T = reset.shape
     losses = {}
     metrics = {}
 
     # World model
-    enc_carry, enc_entries, tokens = self.enc(
-        enc_carry, obs, reset, training)
-    dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
-        dyn_carry, tokens, prevact, reset, training)
-    losses.update(los)
-    metrics.update(mets)
-    dec_carry, dec_entries, recons = self.dec(
-        dec_carry, repfeat, reset, training)
-    inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
-    losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
-    con = f32(~obs['is_terminal'])
+    encoder_state, encoder_entries, tokens = self.encoder(
+        encoder_state, observation, reset, training)
+    dynamic_state, dynamic_entries, loss, representation_features, metric = self.dynamic.loss(
+        dynamic_state, tokens, previous_action, reset, training)
+    losses.update(loss)
+    metrics.update(metric)
+    decoder_state, decoder_entries, reconstructions = self.decoder(
+        decoder_state, representation_features, reset, training)
+    inputs = sg(self.feature2tensor(representation_features), skip=self.config.reward_grad)
+    losses['rew'] = self.reward(inputs, 2).loss(observation['reward'])
+    continuation = f32(~observation['is_terminal'])
     if self.config.contdisc:
-      con *= 1 - 1 / self.config.horizon
-    losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
-    for key, recon in recons.items():
-      space, value = self.obs_space[key], obs[key]
+      continuation *= 1 - 1 / self.config.horizon
+    losses['con'] = self.continuation(self.feature2tensor(representation_features), 2).loss(continuation)
+    for key, reconstruction in reconstructions.items():
+      space, value = self.observation_space[key], observation[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
       target = f32(value) / 255 if isimage(space) else value
-      losses[key] = recon.loss(sg(target))
+      losses[key] = reconstruction.loss(sg(target))
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
@@ -183,58 +176,58 @@ class Agent(embodied.jax.Agent):
     # Imagination
     K = min(self.config.imag_last or T, T)
     H = self.config.imag_length
-    starts = self.dyn.starts(dyn_entries, dyn_carry, K)
-    policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
-    _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
+    starts = self.dynamic.starts(dynamic_entries, dynamic_state, K)
+    policy_func = lambda feat: sample(self.policy(self.feature2tensor(feat), 1))
+    _, imgfeat, imgprevact = self.dynamic.imagine(starts, policy_func, H, training)
     first = jax.tree.map(
-        lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
+        lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), representation_features)
     imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
-    lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat))
-    lastact = jax.tree.map(lambda x: x[:, None], lastact)
-    imgact = concat([imgprevact, lastact], 1)
+    last_action = policy_func(jax.tree.map(lambda x: x[:, -1], imgfeat))
+    last_action = jax.tree.map(lambda x: x[:, None], last_action)
+    image_action = concat([imgprevact, last_action], 1)
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
-    assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
-    inp = self.feat2tensor(imgfeat)
-    los, imgloss_out, mets = imag_loss(
-        imgact,
-        self.rew(inp, 2).pred(),
-        self.con(inp, 2).prob(1),
-        self.pol(inp, 2),
-        self.val(inp, 2),
-        self.slowval(inp, 2),
-        self.retnorm, self.valnorm, self.advnorm,
+    assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(image_action))
+    inputs = self.feature2tensor(imgfeat)
+    loss, imgloss_out, metric = imag_loss(
+        image_action,
+        self.reward(inputs, 2).pred(),
+        self.continuation(inputs, 2).prob(1),
+        self.policy(inputs, 2),
+        self.value(inputs, 2),
+        self.slow_value(inputs, 2),
+        self.returns_norm, self.value_norm, self.advantage_norm,
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
         **self.config.imag_loss)
-    losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
-    metrics.update(mets)
+    losses.update({k: v.mean(1).reshape((B, K)) for k, v in loss.items()})
+    metrics.update(metric)
 
     # Replay
     if self.config.repval_loss:
-      feat = sg(repfeat, skip=self.config.repval_grad)
-      last, term, rew = [obs[k] for k in ('is_last', 'is_terminal', 'reward')]
+      feat = sg(representation_features, skip=self.config.repval_grad)
+      last, term, rew = [observation[k] for k in ('is_last', 'is_terminal', 'reward')]
       boot = imgloss_out['ret'][:, 0].reshape(B, K)
       feat, last, term, rew, boot = jax.tree.map(
           lambda x: x[:, -K:], (feat, last, term, rew, boot))
-      inp = self.feat2tensor(feat)
-      los, reploss_out, mets = repl_loss(
+      inputs = self.feature2tensor(feat)
+      loss, reploss_out, metric = repl_loss(
           last, term, rew, boot,
-          self.val(inp, 2),
-          self.slowval(inp, 2),
-          self.valnorm,
+          self.value(inputs, 2),
+          self.slow_value(inputs, 2),
+          self.value_norm,
           update=training,
           horizon=self.config.horizon,
           **self.config.repl_loss)
-      losses.update(los)
-      metrics.update(prefix(mets, 'reploss'))
+      losses.update(loss)
+      metrics.update(prefix(metric, 'reploss'))
 
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
     loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
 
-    carry = (enc_carry, dyn_carry, dec_carry)
-    entries = (enc_entries, dyn_entries, dec_entries)
-    outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
-    return loss, (carry, entries, outs, metrics)
+    current_state = (encoder_state, dynamic_state, decoder_state)
+    entries = (encoder_entries, dynamic_entries, decoder_entries)
+    outs = {'tokens': tokens, 'repfeat': representation_features, 'losses': losses}
+    return loss, (current_state, entries, outs, metrics)
