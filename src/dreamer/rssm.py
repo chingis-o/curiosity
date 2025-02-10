@@ -18,7 +18,6 @@ class RSSM(nj.Module):
   classes: int = 32
   normalization: str = 'rms'
   activation_func: str = 'gelu'
-  #?
   unroll: bool = False
   #?
   unimix: float = 0.01
@@ -42,17 +41,18 @@ class RSSM(nj.Module):
         deterministic=elements.Space(np.float32, self.deterministic),
         stochastic=elements.Space(np.float32, (self.stochastic, self.classes)))
 
-  def initial(self, bsize):
+  def initial(self, block_size):
     current_state = nn.cast(dict(
-        deterministic=jnp.zeros([bsize, self.deterministic], f32),
-        stochastic=jnp.zeros([bsize, self.stochastic, self.classes], f32)))
+        deterministic=jnp.zeros([block_size, self.deterministic], f32),
+        stochastic=jnp.zeros([block_size, self.stochastic, self.classes], f32)))
     return current_state
 
   #?
-  def truncate(self, entries, carry=None):
+  def truncate(self, entries, current_state=None):
+    #from etries create the current state
     assert entries['deterministic'].ndim == 3, entries['deterministic'].shape
-    carry = jax.tree.map(lambda x: x[:, -1], entries)
-    return carry
+    current_state = jax.tree.map(lambda x: x[:, -1], entries)
+    return current_state
 
   def starts(self, entries, carry, nlast):
     B = len(jax.tree.leaves(carry)[0])
@@ -75,7 +75,7 @@ class RSSM(nj.Module):
       return current_state, entries, feature
 
   #hidden observe?
-  def _observe(self, current_state, tokens, action, reset, training):
+  def _observe(self, current_state, tokens, action, reset):
     deterministic, stochastic, action = nn.mask(
         (current_state['deterministic'], current_state['stochastic'], action), ~reset)
     action = nn.DictConcat(self.action_space, 1)(action)
@@ -103,15 +103,15 @@ class RSSM(nj.Module):
     if single:
       action = policy(stop_gradient(current_state)) if callable(policy) else policy
       #maybe action embedding
-      actemb = nn.DictConcat(self.action_space, 1)(action)
-      deter = self._core(current_state['deterministic'], current_state['stochastic'], actemb)
+      action_embedding = nn.DictConcat(self.action_space, 1)(action)
+      deterministic = self._core(current_state['deterministic'], current_state['stochastic'], action_embedding)
 
-      logit = self._prior(deter)
-      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-      current_state = nn.cast(dict(deter=deter, stoch=stoch))
-      feature = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
+      logit = self._prior(deterministic)
+      stochastic = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+      current_state = nn.cast(dict(deter=deterministic, stoch=stochastic))
+      feature = nn.cast(dict(deter=deterministic, stoch=stochastic, logit=logit))
 
-      assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
+      assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deterministic, stochastic, logit))
       return current_state, (feature, action)
     else:
       unroll = length if self.unroll else 1
@@ -143,34 +143,39 @@ class RSSM(nj.Module):
     metrics['rep_ent'] = self._dist(posterior).entropy().mean()
     return current_state, entries, losses, feature, metrics
 
-  def _core(self, deter, stoch, action):
-    stoch = stoch.reshape((stoch.shape[0], -1))
+  def _core(self, deterministic, stochastic, action):
+    stochastic = stochastic.reshape((stochastic.shape[0], -1))
     action /= stop_gradient(jnp.maximum(1, jnp.abs(action)))
     g = self.blocks
+
     flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
     group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
-    x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
+
+    x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deterministic)
     x0 = nn.act(self.activation_func)(self.sub('dynin0norm', nn.Norm, self.normalization)(x0))
-    x1 = self.sub('dynin1', nn.Linear, self.hidden, **self.kw)(stoch)
+    x1 = self.sub('dynin1', nn.Linear, self.hidden, **self.kw)(stochastic)
     x1 = nn.act(self.activation_func)(self.sub('dynin1norm', nn.Norm, self.normalization)(x1))
     x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
     x2 = nn.act(self.activation_func)(self.sub('dynin2norm', nn.Norm, self.normalization)(x2))
     x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
-    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    x = group2flat(jnp.concatenate([flat2group(deterministic), x], -1))
+
     for i in range(self.dynamic_layers):
       x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deterministic, g, **self.kw)(x)
       x = nn.act(self.activation_func)(self.sub(f'dynhid{i}norm', nn.Norm, self.normalization)(x))
+    
     x = self.sub('dyngru', nn.BlockLinear, 3 * self.deterministic, g, **self.kw)(x)
+    
     gates = jnp.split(flat2group(x), 3, -1)
     reset, cand, update = [group2flat(x) for x in gates]
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
-    deter = update * cand + (1 - update) * deter
-    return deter
+    deterministic = update * cand + (1 - update) * deterministic
+    return deterministic
 
-  def _prior(self, feat):
-    x = feat
+  def _prior(self, feature):
+    x = feature
     for i in range(self.image_layers):
       x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.activation_func)(self.sub(f'prior{i}norm', nn.Norm, self.normalization)(x))

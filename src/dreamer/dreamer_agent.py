@@ -10,7 +10,7 @@ from . import rssm
 
 f32 = jnp.float32
 i32 = jnp.int32
-sg = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs)
+stop_gradient = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs)
 sample = lambda xs: jax.tree.map(lambda x: x.sample(nj.seed()), xs)
 prefix = lambda xs, p: {f'{p}/{k}': v for k, v in xs.items()}
 concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
@@ -100,16 +100,16 @@ class Agent(embodied.jax.Agent):
   def init_report(self, batch_size):
     return self.init_policy(batch_size)
 
-  def policy(self, current_state, observation, mode='train'):
+  def policy(self, current_state, observation):
     (encoder_state, dynamic_state, decoder_state, previous_action) = current_state
-    kw = dict(training=False, single=True)
+    keywords = dict(training=False, single=True)
     reset = observation['is_first']
-    encoder_state, encoder_entry, tokens = self.encoder(encoder_state, observation, reset, **kw)
+    encoder_state, encoder_entry, tokens = self.encoder(encoder_state, observation, reset, **keywords)
     dynamic_state, dynamic_entry, features = self.dynamic.observe(
-        dynamic_state, tokens, previous_action, reset, **kw)
+        dynamic_state, tokens, previous_action, reset, **keywords)
     decoder_entry = {}
     if decoder_state:
-      decoder_state, decoder_entry, reconstruction = self.decoder(decoder_state, features, reset, **kw)
+      decoder_state, decoder_entry, reconstruction = self.decoder(decoder_state, features, reset, **keywords)
     policy = self.policy(self.feature2tensor(features), bdims=1)
     action = sample(policy)
     output = {}
@@ -136,8 +136,6 @@ class Agent(embodied.jax.Agent):
       assert all(x.shape[:2] == (B, T) for x in updates.values()), (
           (B, T), {k: v.shape for k, v in updates.items()})
       outputs['replay'] = updates
-    # if self.config.replay.fracs.priority > 0:
-    #   outs['replay']['priority'] = losses['model']
     current_state = (*current_state, {k: data[k][:, -1] for k in self.action_space})
     return current_state, outputs, metrics
 
@@ -157,7 +155,7 @@ class Agent(embodied.jax.Agent):
     metrics.update(metric)
     decoder_state, decoder_entries, reconstructions = self.decoder(
         decoder_state, representation_features, reset, training)
-    inputs = sg(self.feature2tensor(representation_features), skip=self.config.reward_grad)
+    inputs = stop_gradient(self.feature2tensor(representation_features), skip=self.config.reward_grad)
     losses['rew'] = self.reward(inputs, 2).loss(observation['reward'])
     continuation = f32(~observation['is_terminal'])
     if self.config.contdisc:
@@ -167,7 +165,7 @@ class Agent(embodied.jax.Agent):
       space, value = self.observation_space[key], observation[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
       target = f32(value) / 255 if isimage(space) else value
-      losses[key] = reconstruction.loss(sg(target))
+      losses[key] = reconstruction.loss(stop_gradient(target))
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
@@ -175,18 +173,18 @@ class Agent(embodied.jax.Agent):
 
     # Imagination
     K = min(self.config.imag_last or T, T)
-    H = self.config.imag_length
+    horizon = self.config.imag_length
     starts = self.dynamic.starts(dynamic_entries, dynamic_state, K)
     policy_func = lambda feat: sample(self.policy(self.feature2tensor(feat), 1))
-    _, imgfeat, imgprevact = self.dynamic.imagine(starts, policy_func, H, training)
+    _, imgfeat, imgprevact = self.dynamic.imagine(starts, policy_func, horizon, training)
     first = jax.tree.map(
         lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), representation_features)
-    imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
+    imgfeat = concat([stop_gradient(first, skip=self.config.ac_grads), stop_gradient(imgfeat)], 1)
     last_action = policy_func(jax.tree.map(lambda x: x[:, -1], imgfeat))
     last_action = jax.tree.map(lambda x: x[:, None], last_action)
     image_action = concat([imgprevact, last_action], 1)
-    assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
-    assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(image_action))
+    assert all(x.shape[:2] == (B * K, horizon + 1) for x in jax.tree.leaves(imgfeat))
+    assert all(x.shape[:2] == (B * K, horizon + 1) for x in jax.tree.leaves(image_action))
     inputs = self.feature2tensor(imgfeat)
     loss, imgloss_out, metric = imag_loss(
         image_action,
@@ -205,7 +203,7 @@ class Agent(embodied.jax.Agent):
 
     # Replay
     if self.config.repval_loss:
-      feat = sg(representation_features, skip=self.config.repval_grad)
+      feat = stop_gradient(representation_features, skip=self.config.repval_grad)
       last, term, rew = [observation[k] for k in ('is_last', 'is_terminal', 'reward')]
       boot = imgloss_out['ret'][:, 0].reshape(B, K)
       feat, last, term, rew, boot = jax.tree.map(
